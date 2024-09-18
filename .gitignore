@@ -5,3 +5,5 @@ __pycache__/
 .mypy_cache/
 logs/
 venv/
+ml-pair-trade.code-workspace
+.gitignore
