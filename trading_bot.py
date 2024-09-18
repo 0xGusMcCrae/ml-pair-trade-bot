@@ -22,8 +22,6 @@ class TradingBot():
     def __init__(self):
         self.model = joblib.load('joblib/crypto_trading_model.pkl')
         self.scaler = joblib.load('joblib/scaler.pkl')
-        self.class_to_label = joblib.load('joblib/class_to_label.pkl')
-        print(f"class_to_label: {self.class_to_label}")
         self.test_run = os.getenv("TEST_RUN") == "True"
         self.exchange = ccxt.hyperliquid({
             'walletAddress': os.getenv("ACCOUNT_ADDRESS"),
@@ -105,9 +103,9 @@ class TradingBot():
         return X_scaled
 
     def predict_signals(self, X_scaled):
-        y_pred = self.model.predict(X_scaled)
-        y_pred_labels = pd.Series(y_pred).map(self.class_to_label)
-        return y_pred_labels
+         # Get class probabilities
+        y_pred_proba = self.model.predict_proba(X_scaled)
+        return y_pred_proba
     
     def calculate_order_size(self, symbol, current_price):
         """Half of the account size, inclusive of leverage"""
@@ -116,7 +114,6 @@ class TradingBot():
         # convert to # of coins
     
         return usd_value / current_price / 10
-        # return 0
     
     def get_current_price(self, symbol):
         ticker = self.exchange.fetch_ticker(symbol)
@@ -126,7 +123,7 @@ class TradingBot():
     def close_position(self, position, current_price):
         symbol = position['symbol']
         contracts = position['contracts']  # Number of contracts in the open position
-        side = position['side']
+        side = 'long' if contracts > 0 else 'short'
         
         # Determine the opposite order type
         close_side = 'sell' if side == 'long' else 'buy'
@@ -155,17 +152,14 @@ class TradingBot():
         positions = self.exchange.fetch_positions()
         for position in positions:
             if position['symbol'] == symbol:
-                if (signal == 1 and position['side'] == 'long') or (signal == -1 and position['side'] == 'short'):
+                if (signal == 1 and position['contracts'] > 0) or (signal == -1 and position['contracts'] < 0): # contracts > 0 is a long, contracts < 0 is a short
                     # the desired position is already open, do nothing
-                    log.info(f"Keeping {position['side']} position open for {symbol}")
+                    log.info(f"Keeping {'long' if position['contracts'] > 0 else 'short'} position open for {symbol}")
                     return
                 else:
                     # either closing (signal == 0) or flipping between long and short (i.e. signal was 1, now it's -1) for this position
                     # the opposite order will be opened below where necessary
-                    self.close_position(position, current_price)                
-
-        print(f"Symbol: {symbol}, Signal: {signal}")
-        
+                    self.close_position(position, current_price)                      
         
         amount = self.calculate_order_size(symbol, current_price)
 
@@ -209,22 +203,52 @@ class TradingBot():
             # Preprocess data
             df = self.preprocess_data(df)
 
-            # Reset index to ensure proper alignment
-            df.reset_index(drop=True, inplace=True)
+            # # Reset index to ensure proper alignment
+            df.reset_index(inplace=True)
 
             # Prepare features
             X_scaled = self.prepare_features(df)
 
-            # Predict signals
-            df['predicted_label'] = self.predict_signals(X_scaled)
-            # print(f"predicted_label: {df['predicted_label']}")
-            
+           # Predict class probabilities
+            y_pred_proba = self.predict_signals(X_scaled)  # Shape: (n_samples, n_classes)
+
+            # Add probabilities to df
+            df['prob_neg1'] = y_pred_proba[:, 0]  # Probability for class 0 -> -1
+            df['prob_0'] = y_pred_proba[:, 1]     # Probability for class 1 -> 0
+            df['prob_1'] = y_pred_proba[:, 2]     # Probability for class 2 -> 1
+
+            # Assign signals per day
+            df['Date'] = pd.to_datetime(df['Date'])  # Ensure Date is datetime
+            signals = []
+
+            for date, group in df.groupby('Date'):
+                # Find the symbol with the highest probability for 1
+                if not group.empty:
+                    top_signal_idx = group['prob_1'].idxmax()
+                    bottom_signal_idx = group['prob_neg1'].idxmax()
+
+                    # Initialize all signals to 0
+                    group['predicted_label'] = 0
+
+                    # Assign 1 and -1
+                    group.at[top_signal_idx, 'predicted_label'] = 1
+                    group.at[bottom_signal_idx, 'predicted_label'] = -1
+
+                    signals.append(group)
+
+            # Concatenate all groups
+            df_signals = pd.concat(signals)
+            log.info(f"Assigned signals:\n{df_signals[['symbol', 'predicted_label']].tail()}")
+
+            # Proceed with executing trades
             for symbol in self.symbols:
-                symbol_df = df[df['symbol'] == symbol]
+                symbol_df = df_signals[df_signals['symbol'] == symbol]
                 if symbol_df.empty:
+                    log.warning(f"No data for symbol: {symbol}")
                     continue
                 latest_entry = symbol_df.iloc[-1]
                 signal = latest_entry['predicted_label']
+                log.info(f"Signal for {symbol}: {signal}")
 
                 # Execute trade
                 try:
